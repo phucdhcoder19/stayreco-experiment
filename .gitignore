@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Log chạy thí nghiệm (dung lượng lớn, sinh lại được)
+results/*.log
+
+# Bảng điểm đầy đủ (~11k dòng, sinh lại được; bản sample vẫn giữ)
+results/score_table_seed*.csv
+
+# Thư mục rác do lệnh mkdir lỗi
+{data,models,evaluation,utils,notebooks}/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
