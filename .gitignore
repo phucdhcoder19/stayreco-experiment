@@ -19,3 +19,4 @@ results/score_table_seed*.csv
 .idea/
 Thumbs.db
 desktop.ini
+.pytest_cache/
