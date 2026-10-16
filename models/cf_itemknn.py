@@ -17,6 +17,8 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from scipy.sparse import csr_matrix
 
+from utils.batch import group_positions, map_default, top_k_rows
+
 
 class ItemItemCF:
     """Item-Item CF theo kiểu Tarek et al. (2023)."""
@@ -67,10 +69,40 @@ class ItemItemCF:
 
         rated_idx, dev = self.user_history[user_id]
         sims = self.item_sim[self.item_id_to_idx[item_id], rated_idx]
-        top = np.argsort(-np.abs(sims))[:self.k]
+        # kind="stable" để khớp với predict_many() — xem utils/batch.py
+        top = np.argsort(-np.abs(sims), kind="stable")[:self.k]
         top = top[np.abs(sims[top]) > 0]
 
         pred = base
         if len(top) > 0:
             pred += np.dot(sims[top], dev[top]) / (np.abs(sims[top]).sum() + 1.0)
         return float(np.clip(pred, 1.0, 5.0))
+
+    def predict_many(self, users, items):
+        """Dự đoán cho nhiều cặp (user, item) cùng lúc — xem utils/batch.py.
+
+        Khác Content ở hai chỗ: mức nền là trung bình item (không có bias user),
+        và neighbor xếp theo |sim| vì tương quan âm cũng mang thông tin.
+        """
+        users = np.asarray(users)
+        items = np.asarray(items)
+
+        pred = map_default(items, self.item_means, float(self.global_mean))
+        item_idx = map_default(items, self.item_id_to_idx, -1).astype(np.int64)
+
+        for user_id, pos in group_positions(users):
+            if user_id not in self.user_history:
+                continue
+            rated_idx, dev = self.user_history[user_id]
+            if len(rated_idx) == 0:
+                continue
+            pos = pos[item_idx[pos] >= 0]   # hotel chưa ai rating → Item-Item CF bó tay
+            if len(pos) == 0:
+                continue
+
+            sims = self.item_sim[np.ix_(item_idx[pos], rated_idx)]
+            s, d = top_k_rows(sims, dev, self.k, by_abs=True)
+            mask = np.abs(s) > 0
+            pred[pos] += (s * d * mask).sum(axis=1) / (np.abs(s * mask).sum(axis=1) + 1.0)
+
+        return np.clip(pred, 1.0, 5.0)

@@ -44,9 +44,14 @@ from models.popularity import PopularityBaseline
 from models.lightgcn import LightGCN
 from models import paper_baselines as papers
 from utils.alpha_scheduler import compute_fixed_alpha
-from evaluation.metrics import evaluate_all, evaluate_by_group
+from utils import manifest
+from evaluation.metrics import evaluate_rating, evaluate_rating_by_group
+from evaluation.ranking import (RELEVANCE_THRESHOLD, build_candidate_frame,
+                                cold_item_share, rank_metrics, rank_metrics_by_group)
 
 GROUP_ORDER = ["cold_item", "cold", "cool", "warm"]
+# Nhóm cho metric xếp hạng: gán theo USER nên không có cold_item (xem evaluation/ranking.py)
+RANK_GROUP_ORDER = ["cold (rank)", "cool (rank)", "warm (rank)"]
 GROUP_LABELS = {
     "cold_item": "Cold item (hotel mới)",
     "cold": f"Cold user (n<{COLD_MAX_N})",
@@ -55,6 +60,7 @@ GROUP_LABELS = {
 }
 STAYRECO_TUNED = "★ StayReco (α tuned)"
 STAYRECO_MANUAL = "★ StayReco (α thủ công)"
+SUFFIX = ""   # hậu tố file kết quả, đặt qua --tag=...
 
 
 def weight_methods():
@@ -63,6 +69,10 @@ def weight_methods():
         return lambda s: np.clip(a * s["svdpp"] + b * s["content"] + g * s["demo"], 1, 5)
 
     methods = {
+        # Mốc tham chiếu thấp nhất: mọi phương pháp phải thắng được cái này.
+        # Dacrema et al. (2019) cho thấy popularity đánh bại rất nhiều mô hình
+        # phức tạp khi các mô hình đó không được tune tử tế.
+        "Popularity": lambda s: np.clip(s["popular"], 1, 5),
         "CF Only (SVD++)": blend(1, 0, 0),
         "Content Only": blend(0, 1, 0),
         "Demographic Only": blend(0, 0, 1),
@@ -83,10 +93,10 @@ def run_one_seed(seed):
     print("=" * 70)
 
     # ── 1. Dữ liệu ───────────────────────────────────────
-    print("\n[1/4] Loading dataset...")
+    print("\n[1/6] Loading dataset...")
     ratings_df, items_df, users_df = load_movielens_full()
 
-    print("\n[2/4] Splitting data...")
+    print("\n[2/6] Splitting data...")
     df_train, df_held = simulate_cold_start(
         ratings_df, test_ratio=TEST_RATIO, cold_user_ratio=COLD_USER_RATIO,
         max_cold_n=MAX_COLD_N, cold_item_ratio=COLD_ITEM_RATIO, seed=seed)
@@ -95,7 +105,7 @@ def run_one_seed(seed):
     print("  Rows theo nhóm:", df_held["group"].value_counts().reindex(GROUP_ORDER).to_dict())
 
     # ── 2. Train các model thành phần ────────────────────
-    print("\n[3/4] Training models...")
+    print("\n[3/6] Training models...")
     trainset = to_surprise_trainset(df_train)
     components = {}
 
@@ -129,7 +139,7 @@ def run_one_seed(seed):
     components["popular"] = popular
 
     # ── 3. Hỏi mọi model 1 lần cho mọi dòng val+test ─────
-    print("\n[4/4] Scoring & evaluating...")
+    print("\n[4/6] Scoring cac cap val+test...")
     scores = df_held.copy()
     for name, model in components.items():
         scores[name] = [model.predict(u, i)
@@ -142,26 +152,65 @@ def run_one_seed(seed):
     os.makedirs("results", exist_ok=True)
     cols = ["user_id", "item_id", "rating", "n", "item_n", "group",
             "svdpp", "svd", "itemknn", "lightgcn", "content", "demo", "popular"]
-    test_scores[cols].round(3).to_csv(f"results/score_table_seed{seed}.csv", index=False)
+    test_scores[cols].round(3).to_csv(f"results/score_table_seed{seed}{SUFFIX}.csv", index=False)
     # Bản rút gọn: 50 dòng mỗi nhóm, để mở bằng Excel xem cho dễ
     (test_scores[cols].groupby("group", group_keys=False)
      .apply(lambda g: g.head(50)).round(3)
-     .to_csv(f"results/score_table_sample_seed{seed}.csv", index=False))
+     .to_csv(f"results/score_table_sample_seed{seed}{SUFFIX}.csv", index=False))
 
     # ── 4. Tune các phương pháp trên validation ──────────
     methods = weight_methods()
     paper_methods, chosen, history = papers.build_paper_methods(val_scores)
     methods.update(paper_methods)
 
-    # ── 5. Chấm điểm trên test ───────────────────────────
+    # ── 5. Rổ ứng viên TOÀN CATALOG để đo xếp hạng ───────
+    # Đây là phần sửa lỗi quan trọng: Precision/Recall/NDCG phải được đo khi mỗi
+    # user được xếp hạng trên toàn bộ hotel chưa đặt, không phải chỉ trong số
+    # hotel user đã rating. Xem evaluation/ranking.py và evaluation/metrics.py.
+    print("\n[5/6] Dựng rổ ứng viên toàn catalog...")
+    catalog = items_df["item_id"].to_numpy()
+    seen = pd.concat([df_train[["user_id", "item_id"]],
+                      val_scores[["user_id", "item_id"]]], ignore_index=True)
+    frame, n_relevant = build_candidate_frame(
+        df_train, test_scores, catalog, df_exclude=seen)
+
+    print("  Chấm điểm từng model thành phần trên rổ...")
+    for name, model in components.items():
+        frame[name] = model.predict_many(frame["user_id"].to_numpy(),
+                                         frame["item_id"].to_numpy())
+
+    # Nhóm cold-start gán theo USER (xếp hạng là bài toán theo user, không theo dòng)
+    user_n = frame.groupby("user_id")["n"].first()
+    user_groups = pd.Series(
+        np.select([user_n >= WARM_MIN_N, user_n >= COLD_MAX_N], ["warm", "cool"],
+                  default="cold"),
+        index=user_n.index)
+
+    # ── 6. Chấm điểm trên test ───────────────────────────
+    print("\n[6/6] Chấm điểm từng phương pháp...")
     overall, by_group_rows = {}, []
     for name, predict_fn in methods.items():
+        # (a) Sai số dự đoán — trên các cặp có rating thật
         preds = predict_fn(test_scores)
         results = list(zip(test_scores["user_id"], test_scores["item_id"],
                            test_scores["rating"], preds))
-        overall[name] = evaluate_all(results, TOP_K)
-        for group, metrics in evaluate_by_group(results, test_scores["group"], TOP_K).items():
+        rating_metrics = evaluate_rating(results)
+
+        # (b) Chất lượng xếp hạng — trên rổ toàn catalog
+        ranked = predict_fn(frame)
+        ranking = rank_metrics(frame, ranked, n_relevant, TOP_K, n_catalog=len(catalog))
+        ranking.update(cold_item_share(frame, ranked, TOP_K))
+
+        overall[name] = {**rating_metrics, **ranking}
+        print(f"    {name:<32} RMSE {rating_metrics['rmse']:.4f}  "
+              f"P@10 {ranking['p@10']:.4f}  NDCG@10 {ranking['ndcg@10']:.4f}")
+
+        # Theo nhóm: RMSE giữ nguyên 4 nhóm (có cold_item), xếp hạng chỉ 3 nhóm user
+        for group, metrics in evaluate_rating_by_group(results, test_scores["group"]).items():
             by_group_rows.append({"method": name, "group": group, **metrics})
+        for group, metrics in rank_metrics_by_group(
+                frame, ranked, n_relevant, user_groups, TOP_K, len(catalog)).items():
+            by_group_rows.append({"method": name, "group": f"{group} (rank)", **metrics})
 
     overall_df = pd.DataFrame(overall).T
     overall_df.index.name = "method"
@@ -184,9 +233,9 @@ def run(seeds):
 
 def save_results(overall, by_group, chosen, history, seeds):
     os.makedirs("results", exist_ok=True)
-    overall.to_csv("results/comparison.csv")
-    by_group.to_csv("results/comparison_by_group.csv", index=False)
-    pd.DataFrame(chosen).T.to_csv("results/chosen_params.csv")
+    overall.to_csv(f"results/comparison{SUFFIX}.csv")
+    by_group.to_csv(f"results/comparison_by_group{SUFFIX}.csv", index=False)
+    pd.DataFrame(chosen).T.to_csv(f"results/chosen_params{SUFFIX}.csv")
 
     # Trung bình qua các seed
     order = list(dict.fromkeys(overall.index))
@@ -201,21 +250,32 @@ def save_results(overall, by_group, chosen, history, seeds):
                  for m, s in zip(mean["rmse"], std["rmse"])],
         "MAE": [f"{m:.4f}" for m in mean["mae"]],
         "P@10": [f"{m:.4f}" for m in mean["p@10"]],
+        "R@10": [f"{m:.4f}" for m in mean["r@10"]],
         "NDCG@10": [f"{m:.4f}" for m in mean["ndcg@10"]],
+        "Cov@10": [f"{m:.4f}" for m in mean["cov@10"]],
+        "New@10": [f"{m:.4f}" for m in mean["newitem@10"]],
     }, index=mean.index)
+    print("  P/R/NDCG/Cov = xếp hạng trên TOÀN CATALOG (xem evaluation/ranking.py)")
+    print("  New@10 = tỷ lệ ô hiển thị dành cho hotel chưa ai rating (cold-start phía hotel)")
     print(summary.to_string())
 
     group_mean = by_group.groupby(["method", "group"])["rmse"].mean().unstack()
     group_mean = group_mean.reindex(index=order, columns=GROUP_ORDER)
-    print("\n  RMSE THEO NHÓM")
+    print("\n  RMSE THEO NHÓM (gán theo từng dòng test)")
     print(group_mean.round(4).to_string())
+
+    rank_mean = by_group.groupby(["method", "group"])["ndcg@10"].mean().unstack()
+    rank_mean = rank_mean.reindex(index=order, columns=RANK_GROUP_ORDER)
+    print("\n  NDCG@10 THEO NHÓM USER (xếp hạng toàn catalog; không có nhóm cold_item")
+    print("  vì xếp hạng là bài toán theo user — tình trạng hotel mới xem ở Cov@10 / New@10)")
+    print(rank_mean.round(4).to_string())
 
     print("\n  THAM SỐ ĐÃ CHỌN TRÊN VALIDATION (seed cuối)")
     for name, params in chosen.items():
         print(f"    {name}: {params}")
 
     print("\n✓ Saved results/comparison.csv, comparison_by_group.csv, chosen_params.csv")
-    for plot_fn, path in [(plot_by_group, "comparison.png"), (plot_sensitivity, "sensitivity_alpha.png")]:
+    for plot_fn, path in [(plot_by_group, f"comparison{SUFFIX}.png"), (plot_sensitivity, f"sensitivity_alpha{SUFFIX}.png")]:
         try:
             plot_fn(by_group if plot_fn is plot_by_group else history, order)
             print(f"✓ Chart saved to results/{path}")
@@ -240,15 +300,23 @@ def plot_by_group(by_group_df, method_order):
     import matplotlib.pyplot as plt
 
     highlight, muted, ink = "#2a78d6", "#b4b2a9", "#0b0b0b"
-    metrics = [("rmse", "RMSE (thấp = tốt)"), ("ndcg@10", "NDCG@10 (cao = tốt)")]
     agg = by_group_df.groupby(["method", "group"]).mean(numeric_only=True)
 
-    fig, axes = plt.subplots(len(metrics), len(GROUP_ORDER),
-                             figsize=(19, 0.45 * len(method_order) * len(metrics) + 3), sharey=True)
+    # Hàng trên: RMSE trên 4 nhóm (gán theo dòng test, có cold_item).
+    # Hàng dưới: NDCG@10 trên 3 nhóm user (xếp hạng toàn catalog) — ô đầu để trống
+    # vì xếp hạng không có nhóm cold_item.
+    rows = [("rmse", "RMSE (thấp = tốt)", GROUP_ORDER),
+            ("ndcg@10", "NDCG@10 toàn catalog (cao = tốt)", [None] + RANK_GROUP_ORDER)]
+
+    fig, axes = plt.subplots(len(rows), len(GROUP_ORDER),
+                             figsize=(19, 0.45 * len(method_order) * len(rows) + 3), sharey=True)
     y = list(range(len(method_order)))[::-1]
-    for row, (metric, metric_label) in enumerate(metrics):
-        for col, group in enumerate(GROUP_ORDER):
+    for row, (metric, metric_label, groups) in enumerate(rows):
+        for col, group in enumerate(groups):
             ax = axes[row][col]
+            if group is None:
+                ax.axis("off")
+                continue
             values = np.array([agg.loc[(m, group), metric] for m in method_order])
             colors = [highlight if m.startswith("★") else muted for m in method_order]
             ax.barh(y, values, color=colors, height=0.7, edgecolor="white", linewidth=2)
@@ -264,7 +332,11 @@ def plot_by_group(by_group_df, method_order):
             if row == 0:
                 n_rows = int(agg.loc[(method_order[0], group), "n_rows"])
                 ax.set_title(f"{GROUP_LABELS[group]}\n{n_rows:,} test ratings", fontsize=10, color=ink)
-            if col == 0:
+            else:
+                n_users = int(agg.loc[(method_order[0], group), "n_users"])
+                ax.set_title(f"{group.replace(' (rank)', '')}\n{n_users:,} user",
+                             fontsize=10, color=ink)
+            if col == 0 or (row == 1 and col == 1):
                 ax.set_yticks(y)
                 ax.set_yticklabels(method_order, fontsize=8.5, color=ink)
             ax.set_xlabel(metric_label, fontsize=9, color="#52514e")
@@ -273,7 +345,7 @@ def plot_by_group(by_group_df, method_order):
     fig.suptitle("StayReco vs baselines & 4 bài báo, theo nhóm cold-start (MovieLens 100K)",
                  fontsize=13, color=ink)
     plt.tight_layout()
-    plt.savefig("results/comparison.png", dpi=150, bbox_inches="tight", facecolor="white")
+    plt.savefig(f"results/comparison{SUFFIX}.png", dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
@@ -304,10 +376,52 @@ def plot_sensitivity(history, _order):
 
     fig.suptitle("Độ nhạy của StayReco theo tham số α (chọn trên validation)", fontsize=12)
     plt.tight_layout()
-    plt.savefig("results/sensitivity_alpha.png", dpi=150, bbox_inches="tight", facecolor="white")
+    plt.savefig(f"results/sensitivity_alpha{SUFFIX}.png", dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
 
 if __name__ == "__main__":
-    seeds = [int(s) for s in sys.argv[1:]] or [RANDOM_SEED]
+    # python run_experiment.py 42 1 2 --cold-item=0.2 --tag=schein
+    #   --cold-item : % hotel bị giấu toàn bộ rating (Schein et al. 2002 dùng ~0.2)
+    #   --tag       : hậu tố cho file kết quả, để không ghi đè lần chạy trước
+    seeds = [int(a) for a in sys.argv[1:] if not a.startswith("--")] or [RANDOM_SEED]
+    for arg in sys.argv[1:]:
+        if arg.startswith("--cold-item="):
+            COLD_ITEM_RATIO = float(arg.split("=")[1])
+        elif arg.startswith("--tag="):
+            SUFFIX = "_" + arg.split("=")[1]
+    print(f"COLD_ITEM_RATIO={COLD_ITEM_RATIO}, output suffix='{SUFFIX}'")
+
+    # Ghi manifest TRƯỚC khi chạy: config thật sự dùng, commit, phiên bản thư viện.
+    # Không đọc lại config.py vì CLI có thể đã ghi đè (ví dụ --cold-item).
+    manifest.write(
+        f"results/run_meta{SUFFIX}.json",
+        config={
+            "dataset": "movielens-100k",
+            "test_ratio": TEST_RATIO, "val_ratio": VAL_RATIO,
+            "cold_user_ratio": COLD_USER_RATIO, "max_cold_n": MAX_COLD_N,
+            "cold_item_ratio": COLD_ITEM_RATIO,
+            "warm_min_n": WARM_MIN_N, "cold_max_n": COLD_MAX_N,
+            "svdpp": {"factors": SVDPP_FACTORS, "epochs": SVDPP_EPOCHS,
+                      "lr": SVDPP_LR, "reg": SVDPP_REG},
+            "lightgcn": {"factors": GCN_FACTORS, "layers": GCN_LAYERS,
+                         "epochs": GCN_EPOCHS, "lr": GCN_LR},
+            "content_k": CONTENT_K, "demo_cols": list(DEMO_COLS),
+            "demo_shrinkage": DEMO_SHRINKAGE,
+            "alpha_manual": {"alpha_max": ALPHA_MAX, "n_threshold": N_THRESHOLD,
+                             "gamma_base": GAMMA_BASE},
+            "fixed_alphas": FIXED_ALPHAS, "top_k": list(TOP_K),
+            "relevance_threshold": RELEVANCE_THRESHOLD,
+        },
+        seeds=seeds,
+        extra={"ranking_protocol": (
+            "Precision/Recall/NDCG/Coverage@K xếp hạng trên TOÀN CATALOG: rổ ứng viên "
+            "= mọi item user chưa rating trong train+validation; liên quan = item trong "
+            "test với rating >= ngưỡng. Xem evaluation/ranking.py."
+        ),
+            "tuning_objective": (
+            "Mọi phương pháp được grid search trên validation theo RMSE (không theo "
+            "metric xếp hạng) — như nhau cho tất cả, nhưng phải ghi rõ trong báo cáo."
+        )},
+    )
     run(seeds)

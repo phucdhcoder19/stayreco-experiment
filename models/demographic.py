@@ -12,6 +12,7 @@ về trung bình chung của hotel đó:
 Nhóm càng đông → càng tin trung bình của nhóm.
 """
 
+import numpy as np
 import pandas as pd
 
 
@@ -62,3 +63,21 @@ class DemographicFilter:
         if group is not None and group + (item_id,) in self.group_ratings:
             return self.group_ratings[group + (item_id,)]
         return self.item_means.get(item_id, self.global_avg)
+
+    def predict_many(self, users, items):
+        """Dự đoán cho nhiều cặp (user, item) cùng lúc — xem utils/batch.py.
+
+        Chỉ là tra cứu dict nên không cần ma trận, nhưng vẫn gom thành một vòng
+        lặp duy nhất thay vì gọi lại predict() 1.5 triệu lần.
+        """
+        no_group = (None,)
+        fallback = self.item_means
+        groups = self.user_demo
+        table = self.group_ratings
+        avg = self.global_avg
+        out = np.empty(len(users), dtype=float)
+        for pos, (user_id, item_id) in enumerate(zip(users, items)):
+            group = groups.get(user_id, no_group)
+            value = table.get(group + (item_id,))
+            out[pos] = value if value is not None else fallback.get(item_id, avg)
+        return out

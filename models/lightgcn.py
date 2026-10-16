@@ -19,6 +19,8 @@ với SVD++ / Content / Demographic, nếu không thì không trộn và không 
 
 import numpy as np
 
+from utils.batch import map_default
+
 try:
     import torch
     TORCH_AVAILABLE = True
@@ -114,3 +116,21 @@ class LightGCN:
         if u is not None and i is not None:
             pred += float(np.dot(self.final_emb[u], self.final_emb[self.n_users + i]))
         return float(np.clip(pred, 1.0, 5.0))
+
+    def predict_many(self, users, items):
+        """Dự đoán cho nhiều cặp (user, item) cùng lúc — xem utils/batch.py.
+
+        Sau khi train, embedding đã cố định nên chỉ là một phép nhân ma trận.
+        """
+        uin = map_default(users, self.user_to_idx, -1).astype(np.int64)
+        iin = map_default(items, self.item_to_idx, -1).astype(np.int64)
+
+        pred = np.full(len(uin), self.global_mean, dtype=float)
+        ku, ki = uin >= 0, iin >= 0
+        pred[ku] += self.bu_np[uin[ku]]
+        pred[ki] += self.bi_np[iin[ki]]
+        both = ku & ki
+        if both.any():
+            pred[both] += np.einsum("ij,ij->i", self.final_emb[uin[both]],
+                                    self.final_emb[self.n_users + iin[both]])
+        return np.clip(pred, 1.0, 5.0)

@@ -25,6 +25,8 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+from utils.batch import group_positions, map_default, top_k_rows
+
 
 class ContentBasedFilter:
     """Content-Based recommender dùng TF-IDF trên mô tả hotel."""
@@ -78,10 +80,43 @@ class ContentBasedFilter:
 
         rated_idx, resid = self.user_history[user_id]
         sims = self.item_sim[self.item_id_to_idx[item_id], rated_idx]
-        top = np.argsort(-sims)[:self.k]
+        # kind="stable": khi nhiều hotel giống nhau bằng nhau, luôn chọn cùng một
+        # tập neighbor → chạy lại cho ra đúng số cũ, và khớp với predict_many()
+        top = np.argsort(-sims, kind="stable")[:self.k]
         top = top[sims[top] > 0]
 
         pred = baseline
         if len(top) > 0:
             pred += np.dot(sims[top], resid[top]) / (sims[top].sum() + 1.0)
         return float(np.clip(pred, 1.0, 5.0))
+
+    def predict_many(self, users, items):
+        """Dự đoán cho nhiều cặp (user, item) cùng lúc — xem ghi chú ở cf_svdpp.py.
+
+        Gom các cặp theo user: mỗi user chỉ cần lấy 1 lát ma trận độ giống
+        (số hotel cần đoán × số hotel user đã chấm) rồi tính top-k theo hàng.
+        """
+        users = np.asarray(users)
+        items = np.asarray(items)
+
+        pred = (self.global_mean
+                + map_default(users, self.user_bias, 0.0)
+                + map_default(items, self.item_bias, 0.0))
+        item_idx = map_default(items, self.item_id_to_idx, -1).astype(np.int64)
+
+        for user_id, pos in group_positions(users):
+            if user_id not in self.user_history:
+                continue
+            rated_idx, resid = self.user_history[user_id]
+            if len(rated_idx) == 0:
+                continue
+            pos = pos[item_idx[pos] >= 0]   # hotel không có mô tả → giữ baseline
+            if len(pos) == 0:
+                continue
+
+            sims = self.item_sim[np.ix_(item_idx[pos], rated_idx)]
+            s, r = top_k_rows(sims, resid, self.k, by_abs=False)
+            mask = s > 0
+            pred[pos] += (s * r * mask).sum(axis=1) / ((s * mask).sum(axis=1) + 1.0)
+
+        return np.clip(pred, 1.0, 5.0)

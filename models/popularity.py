@@ -8,6 +8,8 @@ Dùng 2 chỗ:
 Có shrinkage: hotel chỉ 1 người chấm 5 sao thì chưa chắc tốt.
 """
 
+from utils.batch import map_default
+
 
 class PopularityBaseline:
     def __init__(self, shrinkage=5):
@@ -24,3 +26,12 @@ class PopularityBaseline:
 
     def predict(self, user_id, item_id):
         return self.item_means.get(item_id, self.global_mean)
+
+    def predict_many(self, users, items):
+        """Dự đoán cho nhiều cặp cùng lúc — xem utils/batch.py.
+
+        Không phụ thuộc user: mọi khách đều thấy cùng một bảng xếp hạng. Chính vì
+        vậy đây là mốc tham chiếu thấp nhất — mô hình nào không thắng được nó thì
+        chưa học được gì về cá nhân hóa (Dacrema et al., 2019).
+        """
+        return map_default(items, self.item_means, float(self.global_mean))
