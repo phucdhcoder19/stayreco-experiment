@@ -12,7 +12,8 @@ Mọi hàm đều nhận `scores` — bảng đã có sẵn điểm của từng
 
 import numpy as np
 
-from utils.alpha_scheduler import compute_dynamic_alpha
+from utils.alpha_scheduler import (compute_dynamic_alpha, compute_shrinkage_alpha,
+                                   compute_two_stage_alpha)
 from utils.tuning import grid_search, rmse
 
 
@@ -143,6 +144,90 @@ STAYRECO_GRID = {
 }
 
 
+# ── 6. StayReco biến thể shrinkage: α = n/(n+k) ──────────
+# Cùng 3 thành phần, chỉ đổi DẠNG HÀM của trọng số: thay dốc tuyến tính cắt
+# ngọn bằng shrinkage hai phía. Mục đích là tách bạch xem lợi ích đến từ việc
+# "trọng số động" hay từ dạng hàm cụ thể nào.
+
+def stayreco_shrinkage(scores, k_user=10.0, k_item=20.0, gamma_base=0.15):
+    cache = {}
+
+    def weights_for(n, item_n):
+        key = (n, item_n)
+        if key not in cache:
+            cache[key] = compute_shrinkage_alpha(
+                n, item_n=item_n, k_user=k_user, k_item=k_item,
+                gamma_base=gamma_base)
+        return cache[key]
+
+    w = np.array([[v["alpha"], v["beta"], v["gamma"]]
+                  for v in (weights_for(n, m) for n, m in zip(scores["n"], scores["item_n"]))])
+    pred = (w[:, 0] * scores["svdpp"].to_numpy()
+            + w[:, 1] * scores["content"].to_numpy()
+            + w[:, 2] * scores["demo"].to_numpy())
+    return _clip(pred)
+
+
+STAYRECO_SHRINK_GRID = {
+    "k_user": [5, 10, 20, 40],
+    "k_item": [5, 20, 50, 100],
+    "gamma_base": [0.10, 0.15, 0.20],
+}
+
+
+# ── 7. StayReco hai tầng (cấu trúc Ngô Minh Tân + phía hotel) ──
+# Tầng 1 tách CF, tầng 2 chia Content/Demographic — cùng dạng n/(n+k).
+# Chạy 2 biến thể để tách bạch ảnh hưởng của γ ở hotel mới.
+
+def stayreco_two_stage(scores, k_user=10.0, k_item=20.0, k_c=3.0,
+                       zero_gamma_cold_item=False, combine="product"):
+    cache = {}
+
+    def weights_for(n, item_n):
+        key = (n, item_n)
+        if key not in cache:
+            cache[key] = compute_two_stage_alpha(
+                n, item_n=item_n, k_user=k_user, k_item=k_item, k_c=k_c,
+                zero_gamma_cold_item=zero_gamma_cold_item, combine=combine)
+        return cache[key]
+
+    w = np.array([[v["alpha"], v["beta"], v["gamma"]]
+                  for v in (weights_for(n, m) for n, m in zip(scores["n"], scores["item_n"]))])
+    pred = (w[:, 0] * scores["svdpp"].to_numpy()
+            + w[:, 1] * scores["content"].to_numpy()
+            + w[:, 2] * scores["demo"].to_numpy())
+    return _clip(pred)
+
+
+# Lưới rộng hơn lần trước: k_user kéo tới 160 vì lần chạy cũ dừng ở biên 40.
+TWO_STAGE_GRID = {
+    "k_user": [5, 10, 20, 40, 80, 160],
+    "k_item": [5, 20, 50, 100],
+    "k_c": [1, 3, 10, 30],
+}
+
+
+# ABLATION hai phía: cùng sơ đồ 2 tầng + luật γ=0, CHỈ đổi cách gộp α.
+# Lưới k_item mở rộng tới 400 vì lần chạy cũ chọn đúng biên 100.
+TWO_STAGE_GRID_WIDE = {
+    "k_user": [5, 10, 20, 40, 80, 160],
+    "k_item": [5, 20, 50, 100, 200, 400],
+    "k_c": [1, 3, 10, 30],
+}
+# Biến thể "user" không dùng k_item → lưới bỏ chiều đó cho đỡ tốn.
+TWO_STAGE_GRID_USER = {
+    "k_user": [5, 10, 20, 40, 80, 160],
+    "k_item": [1],
+    "k_c": [1, 3, 10, 30],
+}
+ABLATION_VARIANTS = [
+    # (tên, combine, lưới)
+    ("★ Ablation: alpha = t_user (chi phia user)", "user", TWO_STAGE_GRID_USER),
+    ("★ Ablation: alpha = (t_user+t_item)/2", "mean", TWO_STAGE_GRID_WIDE),
+    ("★ Ablation: alpha = t_user*t_item (luoi k' rong)", "product", TWO_STAGE_GRID_WIDE),
+]
+
+
 # ── Gom lại: tune trên validation rồi dự đoán trên test ──
 
 def build_paper_methods(val_scores):
@@ -180,5 +265,32 @@ def build_paper_methods(val_scores):
     best, history = grid_search(STAYRECO_GRID, stayreco, val_scores)
     methods["★ StayReco (α tuned)"] = lambda s, p=best: stayreco(s, **p)
     chosen["★ StayReco (α tuned)"] = best
+
+    print("\n  → StayReco shrinkage: grid search k_user, k_item, γ_base")
+    best, _ = grid_search(STAYRECO_SHRINK_GRID, stayreco_shrinkage, val_scores)
+    methods["★ StayReco (shrinkage n/(n+k))"] = lambda s, p=best: stayreco_shrinkage(s, **p)
+    chosen["★ StayReco (shrinkage n/(n+k))"] = best
+
+    for label, zg in [("2 tang", False), ("2 tang + gamma=0 hotel moi", True)]:
+        name = "★ StayReco (%s)" % label
+        print("\n  → %s: grid search k_user, k_item, k_c" % name)
+        best, _ = grid_search(TWO_STAGE_GRID,
+                              lambda s, **p: stayreco_two_stage(s, zero_gamma_cold_item=zg, **p),
+                              val_scores)
+        methods[name] = lambda s, p=best, z=zg: stayreco_two_stage(s, zero_gamma_cold_item=z, **p)
+        chosen[name] = best
+
+    # Ablation: tất cả đều có luật γ=0, chỉ khác dạng α → tách riêng tác dụng
+    # của việc NHÂN hai phía so với chỉ dùng phía user hoặc lấy trung bình.
+    for name, comb, grid in ABLATION_VARIANTS:
+        print("\n  → %s: grid search" % name)
+        best, _ = grid_search(
+            grid,
+            lambda s, c=comb, **p: stayreco_two_stage(
+                s, zero_gamma_cold_item=True, combine=c, **p),
+            val_scores)
+        methods[name] = lambda s, p=best, c=comb: stayreco_two_stage(
+            s, zero_gamma_cold_item=True, combine=c, **p)
+        chosen[name] = best
 
     return methods, chosen, history

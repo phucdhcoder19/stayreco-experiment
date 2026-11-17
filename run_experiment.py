@@ -33,7 +33,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 from config import *
-from data.loader import load_movielens_full
+from data.loader import load_movielens_full, load_tripadvisor
 from data.preprocessor import (simulate_cold_start, split_validation, assign_groups,
                                to_surprise_trainset)
 from models.cf_svdpp import CollaborativeFilter, PlainSVD
@@ -60,7 +60,10 @@ GROUP_LABELS = {
 }
 STAYRECO_TUNED = "★ StayReco (α tuned)"
 STAYRECO_MANUAL = "★ StayReco (α thủ công)"
-SUFFIX = ""   # hậu tố file kết quả, đặt qua --tag=...
+SUFFIX = ""        # hậu tố file kết quả, đặt qua --tag=...
+DATASET = "movielens"   # đặt qua --dataset=movielens|tripadvisor
+MAX_EVAL_USERS = 0      # 0 = chấm mọi user; >0 = lấy mẫu, đặt qua --max-eval-users=
+DATA_DIR = ""      # thư mục TripAdvisor; rỗng = mặc định. Đặt qua --data-dir=
 
 
 def weight_methods():
@@ -94,7 +97,11 @@ def run_one_seed(seed):
 
     # ── 1. Dữ liệu ───────────────────────────────────────
     print("\n[1/6] Loading dataset...")
-    ratings_df, items_df, users_df = load_movielens_full()
+    if DATASET == "tripadvisor":
+        ratings_df, items_df, users_df = (load_tripadvisor(DATA_DIR) if DATA_DIR
+                                          else load_tripadvisor())
+    else:
+        ratings_df, items_df, users_df = load_movielens_full()
 
     print("\n[2/6] Splitting data...")
     df_train, df_held = simulate_cold_start(
@@ -130,7 +137,8 @@ def run_one_seed(seed):
     content.fit(items_df, df_train)
     components["content"] = content
 
-    demo = DemographicFilter(group_cols=DEMO_COLS, shrinkage=DEMO_SHRINKAGE)
+    demo_cols = ("region", "trip_type") if DATASET == "tripadvisor" else DEMO_COLS
+    demo = DemographicFilter(group_cols=demo_cols, shrinkage=DEMO_SHRINKAGE)
     demo.fit(df_train, users_df)
     components["demo"] = demo
 
@@ -172,7 +180,8 @@ def run_one_seed(seed):
     seen = pd.concat([df_train[["user_id", "item_id"]],
                       val_scores[["user_id", "item_id"]]], ignore_index=True)
     frame, n_relevant = build_candidate_frame(
-        df_train, test_scores, catalog, df_exclude=seen)
+        df_train, test_scores, catalog, df_exclude=seen,
+        max_users=MAX_EVAL_USERS, seed=seed)
 
     print("  Chấm điểm từng model thành phần trên rổ...")
     for name, model in components.items():
@@ -390,14 +399,28 @@ if __name__ == "__main__":
             COLD_ITEM_RATIO = float(arg.split("=")[1])
         elif arg.startswith("--tag="):
             SUFFIX = "_" + arg.split("=")[1]
-    print(f"COLD_ITEM_RATIO={COLD_ITEM_RATIO}, output suffix='{SUFFIX}'")
+        elif arg.startswith("--dataset="):
+            DATASET = arg.split("=")[1]
+        elif arg.startswith("--max-eval-users="):
+            MAX_EVAL_USERS = int(arg.split("=")[1])
+        elif arg.startswith("--data-dir="):
+            DATA_DIR = arg.split("=", 1)[1]
+        elif arg.startswith("--cold-user="):
+            COLD_USER_RATIO = float(arg.split("=")[1])
+        elif arg.startswith("--test-ratio="):
+            TEST_RATIO = float(arg.split("=")[1])
+    print(f"DATASET={DATASET}, COLD_ITEM_RATIO={COLD_ITEM_RATIO}, "
+      f"MAX_EVAL_USERS={MAX_EVAL_USERS}, output suffix='{SUFFIX}'")
 
     # Ghi manifest TRƯỚC khi chạy: config thật sự dùng, commit, phiên bản thư viện.
     # Không đọc lại config.py vì CLI có thể đã ghi đè (ví dụ --cold-item).
     manifest.write(
         f"results/run_meta{SUFFIX}.json",
         config={
-            "dataset": "movielens-100k",
+            "dataset": ("tripadvisor" if DATASET == "tripadvisor" else "movielens-100k"),
+            "data_dir": DATA_DIR or ("data/tripadvisor" if DATASET == "tripadvisor"
+                                     else "data/ml-100k"),
+            "max_eval_users": MAX_EVAL_USERS,
             "test_ratio": TEST_RATIO, "val_ratio": VAL_RATIO,
             "cold_user_ratio": COLD_USER_RATIO, "max_cold_n": MAX_COLD_N,
             "cold_item_ratio": COLD_ITEM_RATIO,

@@ -102,7 +102,7 @@ def load_csv(filepath, rating_scale=(1, 5)):
     reader = Reader(rating_scale=rating_scale)
     data = Dataset.load_from_df(df[required], reader)
 
-    print(f"✓ Loaded {filepath}")
+    print(f"✓ Loaded {filepath}")  
     print(f"  Users: {df['user_id'].nunique()}")
     print(f"  Items: {df['item_id'].nunique()}")
     print(f"  Ratings: {len(df)}")
@@ -131,3 +131,37 @@ def load_user_demographics(filepath):
     assert "user_id" in df.columns, "Thiếu cột 'user_id'"
     print(f"✓ Loaded user demographics: {len(df)} users")
     return df
+
+
+def load_tripadvisor(folder="data/tripadvisor"):
+    """Load TripAdvisor đã tiền xử lý — trả về cùng dạng load_movielens_full().
+
+    Nguồn: github.com/elkablo/gnn-social-tripadvisor
+    (Mrázová & Behún, 2023). Dữ liệu dùng cho nghiên cứu học thuật.
+    Chạy data/prep_tripadvisor.py để sinh 3 file CSV trước.
+
+    ⚠️ KHÁC MovieLens ở phần Demographic: dữ liệu này KHÔNG có tuổi, giới tính
+    hay nghề nghiệp. Chỉ dựng được 2 cột — region (suy từ hometown, 55% có giá
+    trị) và trip_type (loại chuyến đi phổ biến nhất của người đó). Đây là BẢN
+    THÍCH NGHI, phải ghi rõ khi báo cáo: Demographic ở đây yếu hơn trên
+    MovieLens vì chỉ có một chiều địa lý thay vì ba chiều nhân khẩu.
+
+    Returns:
+        ratings_df: user_id, item_id, rating, timestamp
+        items_df:   item_id, description
+        users_df:   user_id, region, trip_type
+    """
+    ratings_df = pd.read_csv(os.path.join(folder, "ratings.csv"),
+                             dtype={"user_id": str, "item_id": str})
+    items_df = pd.read_csv(os.path.join(folder, "items.csv"),
+                           dtype={"item_id": str})
+    users_df = pd.read_csv(os.path.join(folder, "users.csv"),
+                           dtype={"user_id": str})
+
+    print(f"  Users: {len(users_df):,}, Items: {len(items_df):,}, "
+          f"Ratings: {len(ratings_df):,}")
+    return (
+        ratings_df,
+        items_df[["item_id", "description"]],
+        users_df[["user_id", "region", "trip_type"]],
+    )

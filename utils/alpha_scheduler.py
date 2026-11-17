@@ -88,3 +88,90 @@ if __name__ == "__main__":
     for n in [0, 1, 3, 5, 10, 15, 20, 30, 50]:
         w = compute_dynamic_alpha(n)
         print(f"{n:>5} | {w['alpha']:>6.3f} | {w['beta']:>6.3f} | {w['gamma']:>6.3f}")
+
+
+# ── Biến thể shrinkage: α = n/(n+k) ──────────────────────
+# Cơ sở: ước lượng dựa trên ít dữ liệu thì kém tin cậy, nên co về giá trị
+# mặc định. Koren (2008), công thức (2), dùng đúng dạng n/(n+λ) để hạ trọng số
+# các cặp item có ít người cùng rating (λ ≈ 100). models/demographic.py cũng
+# đã dùng dạng này cho điểm trung bình của item (shrinkage=5).
+#
+# Khác với bản tuyến tính ở ba điểm:
+#   1. dốc mạnh lúc đầu rồi thoai thoải — tương tác đầu tiên đáng giá hơn
+#   2. không đứng khựng tại n_threshold, tăng mãi theo n
+#   3. phía hotel trượt mượt thay vì nhảy bậc ở item_n == 0
+
+def compute_shrinkage_alpha(n, item_n=None, k_user=10.0, k_item=20.0,
+                            gamma_base=0.15, has_preferences=False):
+    """Tính (α, β, γ) theo shrinkage hai phía.
+
+    Args:
+        n: số tương tác của user
+        item_n: số rating của hotel (None = không xét phía hotel)
+        k_user: Content đáng giá ngang bao nhiêu lần tương tác của user
+        k_item: cần bao nhiêu rating thì mới tin CF về hotel đó
+        gamma_base: trọng số Demographic khi chưa biết gì về user
+        has_preferences: user đã khai sở thích → bỏ Demographic, dồn cho Content
+
+    Returns:
+        dict {"alpha", "beta", "gamma"} với tổng bằng 1.
+    """
+    trust_user = n / (n + k_user)
+    trust_item = 1.0 if item_n is None else item_n / (item_n + k_item)
+    cf_trust = trust_user * trust_item          # CF phải hiểu CẢ user lẫn hotel
+
+    # Demographic chỉ có ích khi chưa biết gì về user, và tắt dần theo đúng nhịp
+    gamma = 0.0 if has_preferences else gamma_base * (1.0 - trust_user)
+
+    alpha = cf_trust * (1.0 - gamma)
+    beta = 1.0 - alpha - gamma
+    return {"alpha": alpha, "beta": beta, "gamma": gamma}
+
+
+# ── Biến thể 2 tầng (cấu trúc Ngô Minh Tân) + hệ số phía hotel ──
+# Tầng 1: α tách CF khỏi phần còn lại, cần CẢ hai phía có dữ liệu.
+# Tầng 2: π chia phần còn lại giữa Content và Demographic, cùng dạng n/(n+k).
+# Khác bản shrinkage trước ở chỗ γ không còn trần cố định, mà trượt theo
+# chính n — nhất quán một dạng hàm cho cả hai tầng.
+
+def compute_two_stage_alpha(n, item_n=None, k_user=10.0, k_item=20.0, k_c=3.0,
+                            has_preferences=False, zero_gamma_cold_item=False,
+                            combine="product"):
+    """Tính (α, β, γ) theo sơ đồ hai tầng.
+
+    Args:
+        n: số tương tác của user
+        item_n: số rating của hotel (None = không xét phía hotel)
+        k_user: mốc hòa phía user — CF đáng tin ngang phần còn lại
+        k_item: mốc hòa phía hotel
+        k_c: mốc hòa giữa Content và Demographic
+        has_preferences: user đã khai sở thích → bỏ hẳn Demographic
+        zero_gamma_cold_item: hotel chưa ai rating → ép γ=0, dồn cho Content.
+            Demographic ở đó chỉ trả về trung bình chung, không phân biệt được
+            hotel nào với hotel nào, nên chỉ làm loãng tín hiệu Content.
+        combine: cách gộp hai hệ số tin cậy thành α — dùng cho ABLATION:
+            "product" (đề xuất): α = t_user × t_item → thiếu dữ liệu ở BẤT KỲ
+                phía nào thì α = 0.
+            "user": α = t_user, bỏ phía hotel (dạng Melville 2002, Do & Le 2020)
+                → khách quen vẫn dồn trọng số CF lên hotel chưa ai rating.
+            "mean": α = (t_user + t_item)/2 → hotel mới vẫn nhận α = t_user/2.
+    """
+    trust_user = n / (n + k_user)
+    trust_item = 1.0 if item_n is None else item_n / (item_n + k_item)
+
+    if combine == "product":
+        alpha = trust_user * trust_item      # CF phải hiểu cả hai phía
+    elif combine == "user":
+        alpha = trust_user
+    elif combine == "mean":
+        alpha = 0.5 * (trust_user + trust_item)
+    else:
+        raise ValueError("combine phai la product / user / mean: %r" % combine)
+    rest = 1.0 - alpha
+
+    if has_preferences or (zero_gamma_cold_item and item_n == 0):
+        pi = 1.0
+    else:
+        pi = n / (n + k_c)
+
+    return {"alpha": alpha, "beta": rest * pi, "gamma": rest * (1.0 - pi)}

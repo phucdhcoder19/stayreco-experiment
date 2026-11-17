@@ -41,7 +41,8 @@ RELEVANCE_THRESHOLD = 4.0   # rating >= 4 (trên 5) = user thật sự thích
 
 
 def build_candidate_frame(df_train, df_eval, catalog_items,
-                          threshold=RELEVANCE_THRESHOLD, df_exclude=None):
+                          threshold=RELEVANCE_THRESHOLD, df_exclude=None,
+                          max_users=0, seed=42):
     """Dựng bảng ứng viên: mỗi dòng là một cặp (user, hotel user CHƯA rating).
 
     Args:
@@ -51,6 +52,12 @@ def build_candidate_frame(df_train, df_eval, catalog_items,
         df_eval:       DataFrame tập đánh giá (test hoặc validation), có cột rating
         catalog_items: mảng toàn bộ item_id của catalog (gồm cả hotel chưa ai rating)
         threshold:     rating >= ngưỡng này thì coi là user thích
+        max_users:     >0 thì chỉ chấm ngẫu nhiên ngần này user, để rổ không
+                       phình quá lớn trên dataset nhiều user. Vẫn xếp hạng trên
+                       TOÀN catalog cho mỗi user được chọn — đây là lấy mẫu TẬP
+                       ĐÁNH GIÁ, không phải lấy mẫu rổ ứng viên, nên không vi
+                       phạm Krichene & Rendle (2020).
+        seed:          seed cho việc lấy mẫu user ở trên.
         df_exclude:    DataFrame các cặp cần LOẠI khỏi rổ. None → dùng df_train.
                        Khi chấm trên test, nên truyền train + validation: item
                        nằm trong validation ta đã biết đáp án nhưng nó không
@@ -68,6 +75,12 @@ def build_candidate_frame(df_train, df_eval, catalog_items,
     relevant_pairs = df_eval[df_eval["rating"] >= threshold]
     n_relevant = relevant_pairs.groupby("user_id").size()
     users = np.asarray(sorted(n_relevant.index))
+
+    if max_users and len(users) > max_users:
+        rng = np.random.RandomState(seed)
+        users = np.sort(rng.choice(users, max_users, replace=False))
+        n_relevant = n_relevant.loc[users]
+        print(f"  (lấy mẫu {max_users:,} user để chấm xếp hạng)")
 
     # Item mỗi user đã rating (train, và cả validation nếu được truyền) → loại khỏi rổ
     train_seen = df_exclude.groupby("user_id")["item_id"].apply(set).to_dict()

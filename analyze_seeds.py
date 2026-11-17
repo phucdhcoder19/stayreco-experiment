@@ -105,5 +105,10 @@ def main(suffix="", metric="rmse"):
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:]]
+    # --ref="<tên phương pháp>" chọn phương pháp làm mốc so sánh (mặc định: REF ở trên).
+    # Bài báo dùng --ref="★ StayReco (2 tang + gamma=0 hotel moi)".
+    for a in sys.argv[1:]:
+        if a.startswith("--ref="):
+            REF = a.split("=", 1)[1]
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
     main(args[0] if args else "", args[1] if len(args) > 1 else "rmse")
