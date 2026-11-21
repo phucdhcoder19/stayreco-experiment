@@ -45,6 +45,7 @@ from models.lightgcn import LightGCN
 from models import paper_baselines as papers
 from utils.alpha_scheduler import compute_fixed_alpha
 from utils import manifest
+from utils import tuning
 from evaluation.metrics import evaluate_rating, evaluate_rating_by_group
 from evaluation.ranking import (RELEVANCE_THRESHOLD, build_candidate_frame,
                                 cold_item_share, rank_metrics, rank_metrics_by_group)
@@ -63,6 +64,7 @@ STAYRECO_MANUAL = "★ StayReco (α thủ công)"
 SUFFIX = ""        # hậu tố file kết quả, đặt qua --tag=...
 DATASET = "movielens"   # đặt qua --dataset=movielens|tripadvisor
 MAX_EVAL_USERS = 0      # 0 = chấm mọi user; >0 = lấy mẫu, đặt qua --max-eval-users=
+TUNE_METRIC = "rmse"    # tiêu chí grid search: rmse | ndcg, đặt qua --tune-metric=
 DATA_DIR = ""      # thư mục TripAdvisor; rỗng = mặc định. Đặt qua --data-dir=
 
 
@@ -167,6 +169,20 @@ def run_one_seed(seed):
      .to_csv(f"results/score_table_sample_seed{seed}{SUFFIX}.csv", index=False))
 
     # ── 4. Tune các phương pháp trên validation ──────────
+    if TUNE_METRIC == "ndcg":
+        # Rổ ứng viên của VALIDATION: chỉ loại cặp đã có trong train. Test vẫn
+        # nằm trong rổ như mọi hotel chưa biết — lúc tune ta không được biết test.
+        print("\n  Tune theo NDCG@10: dựng rổ ứng viên validation...")
+        val_frame, val_n_rel = build_candidate_frame(
+            df_train, val_scores, items_df["item_id"].to_numpy(),
+            df_exclude=df_train[["user_id", "item_id"]],
+            max_users=MAX_EVAL_USERS, seed=seed + 10_000)
+        for name, model in components.items():
+            val_frame[name] = model.predict_many(val_frame["user_id"].to_numpy(),
+                                                 val_frame["item_id"].to_numpy())
+        tuning.set_ndcg_target(val_frame, val_n_rel)
+    else:
+        tuning.set_rmse_target()
     methods = weight_methods()
     paper_methods, chosen, history = papers.build_paper_methods(val_scores)
     methods.update(paper_methods)
@@ -407,6 +423,9 @@ if __name__ == "__main__":
             DATA_DIR = arg.split("=", 1)[1]
         elif arg.startswith("--cold-user="):
             COLD_USER_RATIO = float(arg.split("=")[1])
+        elif arg.startswith("--tune-metric="):
+            TUNE_METRIC = arg.split("=", 1)[1]
+            assert TUNE_METRIC in ("rmse", "ndcg"), "--tune-metric phai la rmse hoac ndcg"
         elif arg.startswith("--test-ratio="):
             TEST_RATIO = float(arg.split("=")[1])
     print(f"DATASET={DATASET}, COLD_ITEM_RATIO={COLD_ITEM_RATIO}, "
@@ -421,6 +440,7 @@ if __name__ == "__main__":
             "data_dir": DATA_DIR or ("data/tripadvisor" if DATASET == "tripadvisor"
                                      else "data/ml-100k"),
             "max_eval_users": MAX_EVAL_USERS,
+            "tune_metric": TUNE_METRIC,
             "test_ratio": TEST_RATIO, "val_ratio": VAL_RATIO,
             "cold_user_ratio": COLD_USER_RATIO, "max_cold_n": MAX_COLD_N,
             "cold_item_ratio": COLD_ITEM_RATIO,

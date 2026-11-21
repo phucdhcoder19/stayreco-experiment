@@ -31,3 +31,8 @@ external/
 
 # Log chạy thí nghiệm ở thư mục gốc
 /*.log
+
+# Kịch bản thuyết trình cá nhân
+HUONG_DAN.md
+SCRIPT_*.md
+TRINH_BAY_THAY.md

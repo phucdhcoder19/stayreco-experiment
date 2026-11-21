@@ -232,24 +232,47 @@ def cold_item_share(frame, pred, top_k=(5, 10, 20)):
 
     KHÔNG phải "càng cao càng tốt" — đẩy toàn hotel mới lên thì Precision sập.
     Đọc nó CÙNG Precision@K: tốt = giữ Precision mà vẫn chia được chỗ cho hotel mới.
+
+    Ngoài newitem@K còn trả về ba chỉ số trả lời câu "hotel mới được hiện lên
+    có ĐÚNG là hotel user thích không, hay chỉ được chèn vào cho có?":
+
+      newprec@K   trong các ô top-K dành cho hotel mới, bao nhiêu % là hotel
+                  user thật sự thích trong tập đánh giá. NaN nếu không hiện
+                  hotel mới nào (không có gì để đo).
+      newrecall@K trong mọi cặp (user, hotel mới) mà user thích, bao nhiêu %
+                  lọt vào top-K.
+      newbase     mốc ngẫu nhiên của newprec: tỷ lệ cặp (user, hotel mới) trong
+                  rổ là cặp user thích. newprec > newbase nghĩa là phương pháp
+                  chọn hotel mới TỐT HƠN chọn bừa.
     """
     pred = np.asarray(pred, dtype=float)
     users = frame["user_id"].to_numpy()
     items = frame["item_id"].to_numpy()
     is_new = (frame["item_n"].to_numpy() == 0)
+    relevant = frame["relevant"].to_numpy().astype(bool)
 
     order = np.lexsort((items, -pred, users))
-    users_s, is_new_s = users[order], is_new[order]
+    users_s, is_new_s, rel_s = users[order], is_new[order], relevant[order]
     starts = np.flatnonzero(np.r_[True, users_s[1:] != users_s[:-1]])
     ends = np.r_[starts[1:], len(users_s)]
 
     max_k = max(top_k)
     new_flags = np.zeros((len(starts), max_k), dtype=bool)
+    new_hits = np.zeros((len(starts), max_k), dtype=bool)
     filled = np.zeros((len(starts), max_k), dtype=bool)
     for row, (start, end) in enumerate(zip(starts, ends)):
         take = min(max_k, end - start)
         new_flags[row, :take] = is_new_s[start:start + take]
+        new_hits[row, :take] = is_new_s[start:start + take] & rel_s[start:start + take]
         filled[row, :take] = True
 
-    return {f"newitem@{k}": float(new_flags[:, :k].sum() / filled[:, :k].sum())
-            for k in top_k}
+    n_new_pairs = int(is_new.sum())
+    n_new_rel = int((is_new & relevant).sum())
+    out = {"newbase": (n_new_rel / n_new_pairs) if n_new_pairs else float("nan")}
+    for k in top_k:
+        shown = int(new_flags[:, :k].sum())
+        hits = int(new_hits[:, :k].sum())
+        out[f"newitem@{k}"] = float(shown / filled[:, :k].sum())
+        out[f"newprec@{k}"] = (hits / shown) if shown else float("nan")
+        out[f"newrecall@{k}"] = (hits / n_new_rel) if n_new_rel else float("nan")
+    return out

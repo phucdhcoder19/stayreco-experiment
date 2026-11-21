@@ -21,6 +21,32 @@ def _clip(x):
     return np.clip(x, 1.0, 5.0)
 
 
+# Grid search gọi các hàm StayReco hàng trăm lần trên CÙNG một bảng (rổ ứng viên
+# có thể hơn 1 triệu dòng). Trọng số chỉ phụ thuộc cặp (n, item_n), nên tính
+# một lần trên các cặp KHÁC NHAU rồi gán lại theo chỉ số — kết quả y hệt vòng
+# lặp từng dòng cũ. Chỉ số cặp được nhớ theo đúng đối tượng bảng (`is`).
+_PAIR_CACHE = {"frame": None, "uniq": None, "inv": None}
+
+
+def _pairs(scores):
+    c = _PAIR_CACHE
+    if c["frame"] is not scores:
+        nm = np.column_stack([scores["n"].to_numpy(), scores["item_n"].to_numpy()])
+        uniq, inv = np.unique(nm, axis=0, return_inverse=True)
+        c.update(frame=scores, uniq=uniq, inv=inv.ravel())
+    return c["uniq"], c["inv"]
+
+
+def _blend(scores, weights_for):
+    uniq, inv = _pairs(scores)
+    w = np.array([[v["alpha"], v["beta"], v["gamma"]]
+                  for v in (weights_for(n, m) for n, m in uniq)])[inv]
+    pred = (w[:, 0] * scores["svdpp"].to_numpy()
+            + w[:, 1] * scores["content"].to_numpy()
+            + w[:, 2] * scores["demo"].to_numpy())
+    return _clip(pred)
+
+
 # ── 1. Tarek et al. (2023) ───────────────────────────────
 # "A Hybrid Hotel Recommendation Using Collaborative, Content Based and Knowledge Based"
 # Gốc: Item-Item CF + Content (NLP) + Knowledge fallback cho cold user. Trọng số CỐ ĐỊNH.
@@ -128,12 +154,7 @@ def stayreco(scores, alpha_max=0.7, n_threshold=30, gamma_base=0.15, alpha_min=0
             )
         return cache[key]
 
-    w = np.array([[v["alpha"], v["beta"], v["gamma"]]
-                  for v in (weights_for(n, m) for n, m in zip(scores["n"], scores["item_n"]))])
-    pred = (w[:, 0] * scores["svdpp"].to_numpy()
-            + w[:, 1] * scores["content"].to_numpy()
-            + w[:, 2] * scores["demo"].to_numpy())
-    return _clip(pred)
+    return _blend(scores, weights_for)
 
 
 STAYRECO_GRID = {
@@ -160,12 +181,7 @@ def stayreco_shrinkage(scores, k_user=10.0, k_item=20.0, gamma_base=0.15):
                 gamma_base=gamma_base)
         return cache[key]
 
-    w = np.array([[v["alpha"], v["beta"], v["gamma"]]
-                  for v in (weights_for(n, m) for n, m in zip(scores["n"], scores["item_n"]))])
-    pred = (w[:, 0] * scores["svdpp"].to_numpy()
-            + w[:, 1] * scores["content"].to_numpy()
-            + w[:, 2] * scores["demo"].to_numpy())
-    return _clip(pred)
+    return _blend(scores, weights_for)
 
 
 STAYRECO_SHRINK_GRID = {
@@ -191,12 +207,7 @@ def stayreco_two_stage(scores, k_user=10.0, k_item=20.0, k_c=3.0,
                 zero_gamma_cold_item=zero_gamma_cold_item, combine=combine)
         return cache[key]
 
-    w = np.array([[v["alpha"], v["beta"], v["gamma"]]
-                  for v in (weights_for(n, m) for n, m in zip(scores["n"], scores["item_n"]))])
-    pred = (w[:, 0] * scores["svdpp"].to_numpy()
-            + w[:, 1] * scores["content"].to_numpy()
-            + w[:, 2] * scores["demo"].to_numpy())
-    return _clip(pred)
+    return _blend(scores, weights_for)
 
 
 # Lưới rộng hơn lần trước: k_user kéo tới 160 vì lần chạy cũ dừng ở biên 40.

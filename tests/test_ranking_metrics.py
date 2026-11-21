@@ -194,3 +194,125 @@ def test_candidate_frame_skips_users_without_relevant_items():
 
     assert set(frame["user_id"]) == {1}
     assert list(n_rel.index) == [1]
+
+
+def test_cold_item_share_new_item_relevance():
+    """newprec / newrecall / newbase trên một rổ tính tay được.
+
+    user a: top-2 theo điểm là h1 (mới, thích) và h2 (cũ); h3 (mới, thích) đứng 3.
+    user b: top-2 là h4 (mới, KHÔNG thích) và h5 (cũ).
+    Trong top-2: 2 ô hotel mới, 1 ô trúng → newprec@2 = 0.5.
+    Cặp mới mà user thích: (a,h1), (a,h3) → newrecall@2 = 1/2.
+    Rổ có 3 cặp mới, 2 cặp thích → newbase = 2/3.
+    """
+    import pandas as pd
+    from evaluation.ranking import cold_item_share
+    frame = pd.DataFrame({
+        "user_id":  ["a", "a", "a", "b", "b"],
+        "item_id":  ["h1", "h2", "h3", "h4", "h5"],
+        "item_n":   [0, 7, 0, 0, 3],
+        "relevant": [True, False, True, False, False],
+    })
+    pred = [0.9, 0.8, 0.1, 0.9, 0.5]
+    out = cold_item_share(frame, pred, top_k=(2,))
+    assert out["newitem@2"] == 0.5
+    assert out["newprec@2"] == 0.5
+    assert out["newrecall@2"] == 0.5
+    assert abs(out["newbase"] - 2 / 3) < 1e-12
+
+
+def test_cold_item_share_no_new_items_shown_gives_nan():
+    import math
+    import pandas as pd
+    from evaluation.ranking import cold_item_share
+    frame = pd.DataFrame({"user_id": ["a", "a"], "item_id": ["h1", "h2"],
+                          "item_n": [5, 0], "relevant": [False, True]})
+    out = cold_item_share(frame, [0.9, 0.1], top_k=(1,))
+    assert out["newitem@1"] == 0.0
+    assert math.isnan(out["newprec@1"])
+    assert out["newrecall@1"] == 0.0
+
+
+def test_fast_ndcg10_matches_rank_metrics():
+    """Hàm NDCG nhanh dùng lúc tune phải ra ĐÚNG số của rank_metrics(),
+    kể cả khi có điểm bằng nhau (tie-break theo item_id dạng chuỗi)."""
+    import numpy as np
+    import pandas as pd
+    from evaluation.ranking import rank_metrics
+    from utils import tuning
+    rng = np.random.default_rng(0)
+    users = np.repeat([f"u{j}" for j in range(40)], 30)
+    items = np.tile([f"h{j:03d}" for j in rng.permutation(30)], 40)
+    frame = pd.DataFrame({"user_id": users, "item_id": items,
+                          "relevant": rng.random(len(users)) < 0.15})
+    frame.loc[frame.groupby("user_id").head(1).index, "relevant"] = True
+    n_rel = frame[frame.relevant].groupby("user_id").size()
+    tuning.set_ndcg_target(frame, n_rel)
+    try:
+        for pred in (rng.random(len(frame)), np.round(rng.random(len(frame)), 1)):
+            slow = rank_metrics(frame, pred, n_rel, (10,))["ndcg@10"]
+            assert abs(tuning.fast_ndcg10(pred) - slow) < 1e-12
+    finally:
+        tuning.set_rmse_target()
+
+
+def test_stayreco_blend_matches_row_by_row():
+    """_blend (tính trên cặp (n, item_n) khác nhau) phải ra y hệt vòng lặp từng dòng."""
+    from models import paper_baselines as pb
+    from utils.alpha_scheduler import (compute_dynamic_alpha, compute_shrinkage_alpha,
+                                       compute_two_stage_alpha)
+    rng = np.random.default_rng(0)
+    N = 3000
+    scores = pd.DataFrame({
+        "n": rng.integers(0, 40, N), "item_n": rng.choice([0, 0, 1, 3, 7, 50, 200], N),
+        "svdpp": rng.uniform(1, 5, N), "content": rng.uniform(1, 5, N),
+        "demo": rng.uniform(1, 5, N)})
+
+    def row_by_row(fn):
+        w = np.array([[v["alpha"], v["beta"], v["gamma"]]
+                      for v in (fn(n, m) for n, m in zip(scores["n"], scores["item_n"]))])
+        return np.clip(w[:, 0] * scores["svdpp"] + w[:, 1] * scores["content"]
+                       + w[:, 2] * scores["demo"], 1.0, 5.0).to_numpy()
+
+    cases = [
+        (pb.stayreco(scores, alpha_max=0.8, n_threshold=20, gamma_base=0.1, alpha_min=0.1),
+         lambda n, m: compute_dynamic_alpha(n, alpha_max=0.8, n_threshold=20,
+                                            gamma_base=0.1, alpha_min=0.1, item_n=m)),
+        (pb.stayreco_shrinkage(scores, k_user=20, k_item=50, gamma_base=0.2),
+         lambda n, m: compute_shrinkage_alpha(n, item_n=m, k_user=20, k_item=50,
+                                              gamma_base=0.2)),
+    ]
+    for combine in ("product", "user", "mean"):
+        cases.append((
+            pb.stayreco_two_stage(scores, k_user=40, k_item=20, k_c=3,
+                                  zero_gamma_cold_item=True, combine=combine),
+            lambda n, m, c=combine: compute_two_stage_alpha(
+                n, item_n=m, k_user=40, k_item=20, k_c=3,
+                zero_gamma_cold_item=True, combine=c)))
+    for got, fn in cases:
+        np.testing.assert_allclose(np.asarray(got), row_by_row(fn), rtol=0, atol=1e-12)
+
+
+def test_fast_ndcg10_ragged_users_and_heavy_ties():
+    """Rổ lệch (user có 3..60 ứng viên, thứ tự dòng xáo trộn) và điểm hoà dày đặc
+    (điểm nguyên 1..5, như sau khi clip) — vẫn phải khớp rank_metrics()."""
+    from evaluation.ranking import rank_metrics
+    from utils import tuning
+    rng = np.random.default_rng(1)
+    rows = []
+    for j in range(60):
+        k = int(rng.integers(3, 61))
+        for h in rng.choice(200, k, replace=False):
+            rows.append((f"u{j:02d}", f"h{h}", rng.random() < 0.2))
+    frame = pd.DataFrame(rows, columns=["user_id", "item_id", "relevant"])
+    frame.loc[frame.groupby("user_id").head(1).index, "relevant"] = True
+    frame = frame.sample(frac=1.0, random_state=3).reset_index(drop=True)
+    n_rel = frame[frame.relevant].groupby("user_id").size()
+    tuning.set_ndcg_target(frame, n_rel)
+    try:
+        for pred in (rng.integers(1, 6, len(frame)).astype(float),
+                     np.full(len(frame), 5.0), rng.random(len(frame))):
+            slow = rank_metrics(frame, pred, n_rel, (10,))["ndcg@10"]
+            assert abs(tuning.fast_ndcg10(pred) - slow) < 1e-12
+    finally:
+        tuning.set_rmse_target()
